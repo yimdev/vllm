@@ -26,9 +26,7 @@ from vllm.models.deepseek_v41.nvidia.decoder_replay_cudagraph import (
 )
 from vllm.v1.worker.gpu import cudagraph_utils
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-
-DEVICE = torch.device("cuda")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_TOKENS = 401
 HC, HIDDEN = 2, 3
 # decode (1 token), trimmed prefill (300 of 300), untrimmed prefill (100 of 300)
@@ -118,6 +116,30 @@ def test_no_replay_batch_runs_the_whole_batch():
     write_batch_kv.assert_not_called()
 
 
+@pytest.mark.parametrize("num_padded", [None, 2])
+def test_empty_replay_skips_decoder_only_without_pcp_padding(num_padded):
+    """Empty PCP ranks still run padded rows to participate in collectives."""
+    run_layers = MagicMock(side_effect=lambda *states: (states[-1], states[3]))
+    write_batch_kv = MagicMock()
+    layers = DecoderReplayLayers(WINDOW, run_layers, write_batch_kv, set(), "swa")
+    states = _states(NUM_TOKENS)
+    layers.replay_batch = ReplayBatch(
+        torch.empty(0, dtype=torch.int64, device=DEVICE),
+        _context({}),
+        num_padded=num_padded,
+    )
+    with override_forward_context(_context({})):
+        hidden, pre_mix = layers(*states)
+    write_batch_kv.assert_called_once_with(*states)
+    if num_padded is None:
+        run_layers.assert_not_called()
+    else:
+        run_layers.assert_called_once()
+        assert run_layers.call_args.args[0].shape[0] == num_padded
+    torch.testing.assert_close(hidden, torch.zeros_like(states[-1]))
+    torch.testing.assert_close(pre_mix, torch.zeros_like(states[3]))
+
+
 def _graph_context(num_tokens):
     return ForwardContext(
         no_compile_layers={},
@@ -147,6 +169,9 @@ def test_piecewise_graphs_break_out_by_size():
     write_batch_kv.assert_called_once_with(*states)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA graph capture needs CUDA"
+)
 @pytest.mark.parametrize(
     ("moe_backend", "ids_dtype"),
     [

@@ -371,6 +371,13 @@ class CacheConfig:
     eager prefill steps on each request's trailing window only. Requires model
     runner V2."""
 
+    decoder_swa_final_chunk_only: bool = False
+    """Experimental DeepSeek-V4.1 decoder replay only on the final prefill
+    chunk. Reserve a 128-token final chunk and skip the replay layers on earlier
+    chunks. Requires eager model runner V2, no prefix caching or speculative
+    decoding, and a single DP/PP/CP rank. Prompt-logprobs requests keep all rows.
+    This retains bounded replay's approximate SWA semantics."""
+
     kv_cache_memory_bytes: int | None = None
     """Size of KV Cache per GPU in bytes. By default, this is set to None
     and vllm can automatically infer the kv cache size based on
@@ -430,6 +437,7 @@ class CacheConfig:
             # Feature toggles not impacting compiled graph shape
             "kv_sharing_fast_prefill",
             "swa_bounded_replay",
+            "decoder_swa_final_chunk_only",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

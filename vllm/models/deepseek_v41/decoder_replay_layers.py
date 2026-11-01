@@ -116,7 +116,13 @@ class DecoderReplayLayers:
         replay_batch = self.replay_batch
         if replay_batch is None:
             return self.run_layers(hidden_states, *states)
-        # Replay batch steps hold more than `window` tokens: no deferred MoE finalize.
+        if replay_batch.rows.numel() == 0 and replay_batch.num_padded is None:
+            # Intermediate chunks wrote source KV but have no sampled outputs.
+            # Final-chunk-only replay excludes auxiliary hidden-state consumers.
+            pre_mix, residual = states[2], states[-1]
+            assert pre_mix is not None and residual is not None
+            return torch.zeros_like(residual), torch.zeros_like(pre_mix)
+        # Replay inputs must have finalized their MoE reductions before gathering.
         assert isinstance(hidden_states, torch.Tensor)
         rows = replay_batch.rows
         inputs = (hidden_states, *states)

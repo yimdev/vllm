@@ -1531,6 +1531,59 @@ class VllmConfig:
             f'dtype="{model_dtype}". Please set `--kv-cache-dtype` to {allowed}.'
         )
 
+    def _validate_decoder_swa_final_chunk_only(self) -> None:
+        if not self.cache_config.decoder_swa_final_chunk_only:
+            return
+        from vllm.platforms import current_platform
+
+        model = self.model_config
+        parallel = self.parallel_config
+        scheduler = self.scheduler_config
+        if (
+            model is None
+            or getattr(model.hf_text_config, "model_type", None) != "deepseek_v41"
+            or getattr(model.hf_text_config, "sliding_window", None) != 128
+            or not current_platform.is_cuda()
+        ):
+            raise ValueError(
+                "decoder_swa_final_chunk_only requires CUDA DeepSeek-V4.1 "
+                "with a 128-token sliding window."
+            )
+        if (
+            not self.use_v2_model_runner
+            or not model.enforce_eager
+            or not self.cache_config.swa_bounded_replay
+            or self.cache_config.enable_prefix_caching
+            or self.speculative_config is not None
+            or self.kv_transfer_config is not None
+            or self.lora_config is not None
+            or model.enable_prompt_embeds
+            or (
+                model.multimodal_config is not None
+                and not model.multimodal_config.language_model_only
+            )
+            or parallel.pipeline_parallel_size != 1
+            or parallel.data_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or parallel.enable_expert_parallel
+            or parallel.use_ubatching
+            or scheduler.async_scheduling
+        ):
+            raise ValueError(
+                "decoder_swa_final_chunk_only requires eager model runner V2 "
+                "and SWA bounded replay, without prefix caching, speculative "
+                "decoding, KV transfer, LoRA, prompt embeddings, multimodal "
+                "inputs, PP/DP/CP/EP, microbatching or async scheduling."
+            )
+        if scheduler.max_num_batched_tokens < 128 or (
+            0 < scheduler.long_prefill_token_threshold < 128
+        ):
+            raise ValueError(
+                "decoder_swa_final_chunk_only needs a token budget and prefill "
+                "chunk limit of at least 128 (or an unset chunk limit)."
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
         # To give each torch profile run a unique instance name.
@@ -2142,6 +2195,7 @@ class VllmConfig:
         self._validate_profiler_config()
         self._validate_batch_sharded_sampling()
         self._validate_adaptive_verification()
+        self._validate_decoder_swa_final_chunk_only()
 
         # Re-compute compile ranges after platform-specific config updates
         # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)

@@ -847,6 +847,7 @@ class EngineArgs:
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     swa_bounded_replay: bool = CacheConfig.swa_bounded_replay
+    decoder_swa_final_chunk_only: bool = CacheConfig.decoder_swa_final_chunk_only
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
 
@@ -1424,6 +1425,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--swa-bounded-replay", **cache_kwargs["swa_bounded_replay"]
+        )
+        cache_group.add_argument(
+            "--decoder-swa-final-chunk-only",
+            **cache_kwargs["decoder_swa_final_chunk_only"],
         )
         cache_group.add_argument(
             "--mamba-cache-dtype", **cache_kwargs["mamba_cache_dtype"]
@@ -2323,6 +2328,7 @@ class EngineArgs:
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             swa_bounded_replay=self.swa_bounded_replay,
+            decoder_swa_final_chunk_only=self.decoder_swa_final_chunk_only,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,

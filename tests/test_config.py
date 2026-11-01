@@ -65,6 +65,68 @@ from vllm.v1.worker.gpu.spec_decode.lilicorr.config import LiLiCorrSpeculatorCon
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (None, None),
+        ("cache_config.enable_prefix_caching", True),
+        ("cache_config.swa_bounded_replay", False),
+        ("model_config.enforce_eager", False),
+        ("model_config.multimodal_config.language_model_only", False),
+        ("use_v2_model_runner", False),
+        ("parallel_config.data_parallel_size", 2),
+        ("parallel_config.pipeline_parallel_size", 2),
+        ("parallel_config.prefill_context_parallel_size", 2),
+        ("parallel_config.enable_expert_parallel", True),
+        ("scheduler_config.async_scheduling", True),
+        ("scheduler_config.max_num_batched_tokens", 127),
+        ("scheduler_config.long_prefill_token_threshold", 64),
+        ("speculative_config", object()),
+        ("kv_transfer_config", object()),
+    ],
+)
+def test_decoder_swa_final_chunk_only_validation(monkeypatch, field, value):
+    """Reject combinations that can bypass the final-window execution contract."""
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    config = SimpleNamespace(
+        cache_config=CacheConfig(
+            decoder_swa_final_chunk_only=True, enable_prefix_caching=False
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                model_type="deepseek_v41", sliding_window=128
+            ),
+            enforce_eager=True,
+            enable_prompt_embeds=False,
+            is_multimodal_model=True,
+            multimodal_config=SimpleNamespace(language_model_only=True),
+        ),
+        parallel_config=ParallelConfig(),
+        scheduler_config=SchedulerConfig(
+            max_model_len=2048,
+            is_encoder_decoder=False,
+            max_num_batched_tokens=256,
+            max_num_seqs=8,
+            long_prefill_token_threshold=0,
+            async_scheduling=False,
+        ),
+        use_v2_model_runner=True,
+        speculative_config=None,
+        kv_transfer_config=None,
+        lora_config=None,
+    )
+    if field is None:
+        VllmConfig._validate_decoder_swa_final_chunk_only(config)
+    else:
+        parent = config
+        *path, name = field.split(".")
+        for part in path:
+            parent = getattr(parent, part)
+        setattr(parent, name, value)
+        with pytest.raises(ValueError, match="decoder_swa_final_chunk_only"):
+            VllmConfig._validate_decoder_swa_final_chunk_only(config)
+
+
 def test_nested_rope_validation_patch_preserves_flat_rope_parameters(monkeypatch):
     calls = []
 

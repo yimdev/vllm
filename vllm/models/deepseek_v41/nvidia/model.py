@@ -847,6 +847,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ],
             vllm_config.scheduler_config.max_num_batched_tokens,
         )
+        cut = max(config.kv_source_layer_ids)
         if self.fuse_mhc_all_reduce:
             # A MoE's top-k finalize folds into the next layer's first mHC
             # boundary, which the last local layer lacks and an engram layer
@@ -855,7 +856,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             for layer, successor in zip(local_layers, local_layers[1:]):
                 assert isinstance(layer, DeepseekV4DecoderLayer)
                 assert isinstance(successor, DeepseekV4DecoderLayer)
-                if successor.engram is None:
+                # A short final chunk still gathers the replay inputs, so its
+                # predecessor must materialize a tensor even below the MoE ceiling.
+                materialize_replay_input = (
+                    vllm_config.cache_config.decoder_swa_final_chunk_only
+                    and successor is self.layers[cut]
+                )
+                if successor.engram is None and not materialize_replay_input:
                     layer.ffn.defer_finalize()
 
         # Decoder-side SWA bounded replay: in eager prefill steps the layers past
@@ -863,7 +870,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (decoder_replay_layers.py).
         self.decoder_replay_layers: DecoderReplayLayers | None = None
         self.decoder_replay_start = self.end_layer
-        cut = max(config.kv_source_layer_ids)
         if (
             cut < self.end_layer - 1
             and self._decoder_replay_supported(vllm_config, cut)
@@ -897,6 +903,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 cut + 1,
                 self.end_layer - 1,
                 config.sliding_window,
+            )
+
+        if (
+            vllm_config.cache_config.decoder_swa_final_chunk_only
+            and self.decoder_replay_layers is None
+        ):
+            raise ValueError(
+                "decoder_swa_final_chunk_only requires supported decoder replay layers."
             )
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids

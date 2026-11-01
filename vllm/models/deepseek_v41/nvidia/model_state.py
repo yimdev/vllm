@@ -503,6 +503,9 @@ class DeepseekV41ModelState(DefaultModelState):
         layers = self.decoder_replay_layers
         assert layers is not None
         layers.replay_batch = None
+        final_chunk_only = self.vllm_config.cache_config.decoder_swa_final_chunk_only
+        if final_chunk_only and cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError("Final-chunk decoder replay requires eager execution.")
         force_replay_batch = capture_desc is not None or (
             cudagraph_mode == CUDAGraphMode.PIECEWISE
             and layers.graph_uses_replay_batch(input_batch.num_tokens_after_padding)
@@ -518,6 +521,7 @@ class DeepseekV41ModelState(DefaultModelState):
         pcp = input_batch.pcp
         kv_start: np.ndarray | None = None
         num_padded: int | None = None
+        deferred = np.zeros(num_reqs, dtype=np.bool_)
         if pcp is not None:
             # Every trimmed request spans all ranks, so each rank can derive
             # the same global kept count from its local request segments.
@@ -540,6 +544,21 @@ class DeepseekV41ModelState(DefaultModelState):
             kept_lens = np.where(
                 keeps_rows, query_lens, np.minimum(query_lens, layers.window)
             )
+            if final_chunk_only:
+                deferred = input_batch.is_prefilling_np[:num_reqs] & ~keeps_rows
+                incomplete = (
+                    input_batch.num_computed_prefill_tokens_np[:num_reqs] + query_lens
+                    < input_batch.prefill_len_np[:num_reqs]
+                )
+                final = deferred & ~incomplete
+                required = np.minimum(
+                    input_batch.prefill_len_np[:num_reqs], layers.window
+                )
+                if (query_lens[final] < required[final]).any():
+                    raise RuntimeError(
+                        "Final prefill chunk does not contain the replay tail."
+                    )
+                kept_lens[deferred & incomplete] = 0
             # Idle DP batches have stale request slots and no context; keep one row.
             is_dummy = not input_batch.is_prefilling_np[:num_reqs].any() and bool(
                 (seq_lens == query_lens).all()
@@ -547,8 +566,14 @@ class DeepseekV41ModelState(DefaultModelState):
             if is_dummy and capture_desc is None:
                 kept_lens = np.zeros_like(kept_lens)
                 kept_lens[0] = 1
-            needs_replay_batch = force_replay_batch or bool(
-                (kept_lens < query_lens)[input_batch.is_prefilling_np[:num_reqs]].any()
+            needs_replay_batch = (
+                force_replay_batch
+                or bool(deferred.any())
+                or bool(
+                    (kept_lens < query_lens)[
+                        input_batch.is_prefilling_np[:num_reqs]
+                    ].any()
+                )
             )
         num_tokens = int(kept_lens.sum())
         if num_padded is None:
@@ -559,6 +584,13 @@ class DeepseekV41ModelState(DefaultModelState):
                 needs_replay_batch, num_padded
             )
         if not needs_replay_batch:
+            return
+
+        if final_chunk_only and num_tokens == 0:
+            layers.replay_batch = ReplayBatch(
+                self._kept_rows[:0],
+                create_forward_context({}, self.vllm_config, slot_mapping={}),
+            )
             return
 
         kept_replay_start = replay_start
@@ -586,6 +618,49 @@ class DeepseekV41ModelState(DefaultModelState):
         kept_batch, kept_slot_mappings = self._kept_input_batch(
             input_batch, slot_mappings, kept_replay_start, kept_lens, num_padded
         )
+        kept_kv_start = self._kept_kv_start[:num_reqs]
+        if deferred.any():
+            # Even an exactly-window-sized final chunk follows skipped layers.
+            # Their KV below this window was never produced; the source layer's
+            # full KV keeps its original floor in the separate build below.
+            deferred_gpu = torch.tensor(deferred, device=self.device)
+            kept_kv_start = torch.where(
+                deferred_gpu,
+                torch.maximum(
+                    kept_kv_start, input_batch.seq_lens[:num_reqs] - layers.window
+                ),
+                kept_kv_start,
+            )
+        active = np.flatnonzero(kept_lens)
+        if final_chunk_only and len(active) != num_reqs:
+            active_gpu = torch.tensor(active, device=self.device)
+            boundaries = np.append(active, num_reqs)
+            boundaries_gpu = torch.tensor(boundaries, device=self.device)
+            kept_batch = replace(
+                kept_batch,
+                req_ids=[input_batch.req_ids[i] for i in active],
+                num_reqs=len(active),
+                num_reqs_after_padding=len(active),
+                idx_mapping=input_batch.idx_mapping[active_gpu],
+                idx_mapping_np=input_batch.idx_mapping_np[active],
+                num_scheduled_tokens=kept_lens[active],
+                query_start_loc=kept_batch.query_start_loc[boundaries_gpu],
+                query_start_loc_np=kept_batch.query_start_loc_np[boundaries],
+                seq_lens=input_batch.seq_lens[active_gpu],
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound[active],
+                num_computed_tokens_np=input_batch.num_computed_tokens_np[active],
+                prefill_len_np=input_batch.prefill_len_np[active],
+                num_computed_prefill_tokens_np=(
+                    input_batch.num_computed_prefill_tokens_np[active]
+                ),
+                is_prefilling_np=input_batch.is_prefilling_np[active],
+                has_prefill=bool(input_batch.is_prefilling_np[active].any()),
+                prompt_lens=None,
+                prefill_runs_as_decode_np=None,
+            )
+            block_tables = tuple(table[active_gpu] for table in block_tables)
+            kept_kv_start = kept_kv_start[active_gpu]
+            replay_start = replay_start[active_gpu]
         if self._replay_attn_groups is None:
             self._replay_attn_groups = (
                 self._copy_attn_groups(attn_groups, layers.metadata_prefixes),
@@ -599,9 +674,7 @@ class DeepseekV41ModelState(DefaultModelState):
             kept_slot_mappings,
             replay_groups,
             kv_cache_config,
-            model_specific_attn_metadata=ReplayAttnMetadata(
-                self._kept_kv_start[:num_reqs]
-            ),
+            model_specific_attn_metadata=ReplayAttnMetadata(kept_kv_start),
         )
         # The first replay layer wrote every row's window KV: its window starts
         # are the batch's.

@@ -23,7 +23,11 @@ from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 from vllm.models.deepseek_v41.nvidia.model_state import DeepseekV41ModelState
 from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
+    InputBuffers,
+    get_num_sampled_and_rejected,
+)
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
@@ -71,6 +75,7 @@ def state(monkeypatch, request):
     cfg.parallel_config.enable_expert_parallel = False
     cfg.parallel_config.prefill_context_parallel_size = getattr(request, "param", 1)
     cfg.aux_output_config.enable_return_routed_experts = False
+    cfg.cache_config.decoder_swa_final_chunk_only = False
     cfg.compilation_config.fast_moe_cold_start = False
     cfg.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     layers = DecoderReplayLayers(WINDOW, MagicMock(), MagicMock(), set(), "swa_first")
@@ -82,6 +87,7 @@ def state(monkeypatch, request):
             batch=input_batch,
             cg_mode=cg_mode,
             slot_mappings=slot_mappings.clone(),
+            block_tables=block_tables,
             replay_start=kw["model_specific_attn_metadata"].replay_start,
             attn_metadata=object(),
         )
@@ -343,6 +349,114 @@ def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
     assert state.decoder_replay_layers.replay_batch is None
 
 
+@pytest.mark.parametrize("intermediate_index", [0, 1, 2])
+def test_final_chunk_only_compacts_requests_and_block_tables(state, intermediate_index):
+    """Skipped requests must not shift the surviving requests' KV page tables."""
+    state.vllm_config.cache_config.decoder_swa_final_chunk_only = True
+    lengths = [1, 128]
+    seq_lens = [500, 4160]
+    prefilling = [False, True]
+    prefill_lens = [400, 4160]
+    lengths.insert(intermediate_index, 300)
+    seq_lens.insert(intermediate_index, 300)
+    prefilling.insert(intermediate_index, True)
+    prefill_lens.insert(intermediate_index, 4160)
+    batch = _input_batch(lengths, seq_lens, prefilling)
+    batch = replace(
+        batch,
+        prefill_len_np=np.array(prefill_lens),
+        num_computed_prefill_tokens_np=np.array(seq_lens) - lengths,
+    )
+    tables = tuple(
+        torch.arange(12, device=DEVICE).reshape(3, 4) + g * 20 for g in range(2)
+    )
+    state.prepare_attn(
+        batch, CUDAGraphMode.NONE, tables, _slot_mappings(batch.num_tokens), [], GROUPS
+    )
+    replay = state.decoder_replay_layers.replay_batch
+    assert replay is not None
+    active = [i for i in range(3) if i != intermediate_index]
+    expected_rows = [
+        row
+        for i in active
+        for row in range(batch.query_start_loc_np[i], batch.query_start_loc_np[i + 1])
+    ]
+    assert replay.rows.tolist() == expected_rows
+    build, first = state.builds[-2:]
+    assert build.batch.num_reqs == 2
+    assert build.batch.query_start_loc.tolist() == [0, 1, 129]
+    assert build.batch.seq_lens.tolist() == [500, 4160]
+    assert build.batch.req_ids == [batch.req_ids[i] for i in active]
+    for actual, full in zip(build.block_tables, tables):
+        torch.testing.assert_close(actual, full[active])
+    assert build.replay_start.tolist() == [0, 4032]
+    assert first.replay_start.tolist() == [0, 0]
+
+
+def test_final_chunk_only_skips_all_intermediate_requests(state):
+    state.vllm_config.cache_config.decoder_swa_final_chunk_only = True
+    batch = _input_batch([300, 64], [300, 364], [True, True])
+    batch = replace(
+        batch,
+        prefill_len_np=np.array([4160, 4160]),
+        num_computed_prefill_tokens_np=np.array([0, 300]),
+    )
+    state.prepare_attn(
+        batch,
+        CUDAGraphMode.NONE,
+        BLOCK_TABLES,
+        _slot_mappings(batch.num_tokens),
+        [],
+        GROUPS,
+    )
+    assert state.decoder_replay_layers.replay_batch.rows.numel() == 0
+    assert len(state.builds) == 1  # Only source-layer/full-batch metadata.
+
+
+@pytest.mark.parametrize("length", [1, 127, 128, 129])
+def test_final_chunk_only_handles_short_prompts(state, length):
+    state.vllm_config.cache_config.decoder_swa_final_chunk_only = True
+    batch = _input_batch([length], [length], [True])
+    batch = replace(batch, prefill_len_np=np.array([length]))
+    replay, build = _prepare(state, batch, CUDAGraphMode.NONE)
+    assert replay.rows.tolist() == list(range(max(0, length - WINDOW), length))
+    assert build.replay_start.tolist() == [max(0, length - WINDOW)]
+
+
+def test_final_chunk_only_rejects_a_short_final_chunk(state):
+    """A scheduler invariant violation must not read uninitialized decoder KV."""
+    state.vllm_config.cache_config.decoder_swa_final_chunk_only = True
+    batch = _input_batch([64], [4160], [True])
+    batch = replace(
+        batch,
+        prefill_len_np=np.array([4160]),
+        num_computed_prefill_tokens_np=np.array([4096]),
+    )
+    with pytest.raises(RuntimeError, match="does not contain the replay tail"):
+        _prepare(state, batch, CUDAGraphMode.NONE)
+
+
+def test_final_chunk_only_keeps_prompt_logprobs_on_intermediate_chunks(state):
+    state.vllm_config.cache_config.decoder_swa_final_chunk_only = True
+    state._keeps_rows_np[0] = True
+    batch = _input_batch([300], [300], [True])
+    batch = replace(batch, prefill_len_np=np.array([4160]))
+    assert _prepare(state, batch, CUDAGraphMode.NONE) == (None, None)
+
+
+def test_skipped_decoder_outputs_are_not_sampled():
+    """The runner discards intermediate-chunk placeholder logits in mixed batches."""
+    sampled, rejected = get_num_sampled_and_rejected(
+        torch.ones(3, dtype=torch.int32, device=DEVICE),
+        torch.tensor([300, 4160, 500], dtype=torch.int32, device=DEVICE),
+        torch.arange(4, dtype=torch.int32, device=DEVICE),
+        torch.arange(3, dtype=torch.int32, device=DEVICE),
+        torch.tensor([4160, 4160, 499], dtype=torch.int32, device=DEVICE),
+    )
+    assert sampled.tolist() == [0, 1, 1]
+    assert rejected.tolist() == [0, 0, 0]
+
+
 @pytest.mark.parametrize("cg_mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE])
 def test_aux_output_requests_keep_every_routing_row(state, cg_mode):
     """R3 needs every prefill row even when final logits only need the window."""
@@ -495,6 +609,7 @@ def test_zero_prefix_window_warms_gather_and_skips_pad(monkeypatch):
     cfg.scheduler_config.max_num_batched_tokens = 1024
     cfg.parallel_config.data_parallel_size = 1
     cfg.parallel_config.prefill_context_parallel_size = 1
+    cfg.cache_config.decoder_swa_final_chunk_only = False
     cfg.compilation_config.fast_moe_cold_start = False
     cfg.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     layers = SimpleNamespace(window=WINDOW, replay_batch=None, metadata_prefixes=set())

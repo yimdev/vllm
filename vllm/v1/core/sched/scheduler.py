@@ -680,19 +680,22 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: int,
         num_new_tokens: int,
     ) -> int:
-        """Never end a prefill chunk within num_prefill_lookahead of the
-        prefill end.
+        """Reserve the drafter's lookahead or the decoder replay's final window.
 
         At a chunked-prefill boundary, the multi-module MTP drafter consumes
         the next num_prefill_lookahead known prefill tokens as draft inputs. A
         boundary closer to the end than that would make it fall back to
         sampled drafts, permanently polluting the trailing modules' KV caches.
         Either finish the prefill or leave at least num_prefill_lookahead for
-        the next chunk. No-op for eagle-family drafters (lookahead 1).
+        the next chunk. Final-chunk decoder replay also reserves its SWA window.
         """
+        tail = self.num_prefill_lookahead
+        if self.cache_config.decoder_swa_final_chunk_only:
+            # The final forward must contain the entire decoder replay window.
+            tail = max(tail, 128)
         remaining = request.num_tokens - num_computed_tokens - num_new_tokens
-        if 0 < remaining < self.num_prefill_lookahead:
-            num_new_tokens -= self.num_prefill_lookahead - remaining
+        if 0 < remaining < tail:
+            num_new_tokens -= tail - remaining
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:

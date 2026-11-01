@@ -154,6 +154,59 @@ def test_add_requests():
         assert len(scheduler.waiting) == i + 1
 
 
+@pytest.mark.parametrize(
+    ("prompt_len", "expected_chunks"),
+    [(64, [64]), (128, [128]), (129, [129]), (320, [192, 128]), (576, [256, 192, 128])],
+)
+def test_decoder_final_chunk_reserves_tail(prompt_len, expected_chunks):
+    """Both admission and running chunks leave the whole replay tail together."""
+    scheduler = create_scheduler(max_num_batched_tokens=256, max_model_len=2048)
+    scheduler.cache_config.decoder_swa_final_chunk_only = True
+    (request,) = create_requests(num_requests=1, num_tokens=prompt_len)
+    scheduler.add_request(request)
+    for index, count in enumerate(expected_chunks):
+        output = scheduler.schedule()
+        assert output.num_scheduled_tokens == {request.request_id: count}
+        final = index == len(expected_chunks) - 1
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[42] if final else []],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        assert list(request.output_token_ids) == ([42] if final else [])
+
+
+def test_decoder_final_chunk_waits_for_enough_budget():
+    """A partial budget cannot consume the start of a reserved final window."""
+    scheduler = create_scheduler(max_num_batched_tokens=256, max_model_len=2048)
+    scheduler.cache_config.decoder_swa_final_chunk_only = True
+    (first,) = create_requests(num_requests=1, num_tokens=192, req_ids=["first"])
+    (tail,) = create_requests(num_requests=1, num_tokens=128, req_ids=["tail"])
+    scheduler.add_request(first)
+    scheduler.add_request(tail)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"first": 192}
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=["first"],
+            req_id_to_index={"first": 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["tail"] == 128
+
+
 @pytest.mark.parametrize("max_tokens", [1, 2])
 def test_routed_experts_prompt_start_at_prompt_end(max_tokens):
     """A prompt-end offset should return empty routing data, not crash."""
